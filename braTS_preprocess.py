@@ -64,7 +64,7 @@ Usage:
                                                           # must be patient-folder names
                                                           # directly under this root
 
-Output layout (medulloblastoma/PreProcessed/<stage>/<subject_id>/<modality>.nii.gz):
+Output layout (medulloblastoma/PreProcessed/<subject_id>/<stage>/<modality>.nii.gz):
     00_raw_nifti/         DICOM -> NIfTI, no other changes
     01_registered/        t1c/t2w/t2f rigidly registered onto the t1n grid
     02_resampled_1mm/     all 4 modalities resampled to isotropic 1x1x1mm
@@ -76,6 +76,8 @@ import argparse
 import csv
 import shutil
 import subprocess
+import sys
+import traceback
 from pathlib import Path
 
 import pydicom
@@ -116,7 +118,12 @@ def load_registry(path: Path) -> list:
 
     with path.open(newline="") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"{path} is empty (no header row); expected columns: {', '.join(required_cols)}")
         reader.fieldnames = [(name or "").strip() for name in reader.fieldnames]
+        missing_cols = [c for c in required_cols if c not in reader.fieldnames]
+        if missing_cols:
+            raise ValueError(f"{path}: header is missing column(s): {', '.join(missing_cols)}")
         for row_num, row in enumerate(reader, start=2):
             for col in required_cols:
                 if not (row.get(col) or "").strip():
@@ -200,7 +207,7 @@ def verify_patient_identity(job: dict, series_root: Path):
 
 
 def stage_dir(job: dict, name: str) -> Path:
-    d = PREPROCESS_DIR / name / job["subject_id"]
+    d = PREPROCESS_DIR / job["subject_id"] / name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -331,7 +338,14 @@ def step4_skullstrip(job: dict, resampled_paths: dict, device: str = "cpu") -> d
     out_dir = stage_dir(job, "03_final")
     hdbet_work = out_dir / "_hdbet_tmp"
     hdbet_work.mkdir(exist_ok=True)
+    try:
+        return _skullstrip_with_hdbet(resampled_paths, out_dir, hdbet_work, device)
+    finally:
+        # HD-BET failing (or not being installed) must not leave a half-filled temp dir behind
+        shutil.rmtree(hdbet_work, ignore_errors=True)
 
+
+def _skullstrip_with_hdbet(resampled_paths: dict, out_dir: Path, hdbet_work: Path, device: str) -> dict:
     t1_brain = hdbet_work / "t1n_brain.nii.gz"
     cmd = [
         "hd-bet", "-i", str(resampled_paths["t1n"]), "-o", str(t1_brain),
@@ -363,7 +377,6 @@ def step4_skullstrip(job: dict, resampled_paths: dict, device: str = "cpu") -> d
 
     mask_out = out_dir / "brain_mask.nii.gz"
     sitk.WriteImage(mask, str(mask_out))
-    shutil.rmtree(hdbet_work)
     out_paths["brain_mask"] = mask_out
     return out_paths
 
@@ -485,22 +498,38 @@ def main():
 
     PREPROCESS_DIR = args.out_root.resolve()
 
-    jobs = load_registry(args.registry)
+    try:
+        jobs = load_registry(args.registry)
+    except (OSError, ValueError, csv.Error) as e:
+        print(f"ERROR: could not load registry: {e}", file=sys.stderr)
+        sys.exit(2)
     if not jobs:
-        print(f"{args.registry} has no rows yet -- run select_modalities.py (or preprocess_gui.py) "
-              f"and add rows before running this script.")
-        return
+        print(f"ERROR: {args.registry} has no rows yet -- run select_modalities.py (or preprocess_gui.py) "
+              f"and add rows before running this script.", file=sys.stderr)
+        sys.exit(1)
 
     if args.subject:
         jobs = [j for j in jobs if j["subject_id"] == args.subject]
 
     if not jobs:
-        print("No registry rows match the given --subject filter.")
-        return
+        print(f"ERROR: no registry rows match --subject {args.subject}", file=sys.stderr)
+        sys.exit(1)
 
+    failed = []
     for job in jobs:
-        run_job(job, args.raw_root, args.skip_hdbet, args.skip_atlas, args.device)
+        try:
+            run_job(job, args.raw_root, args.skip_hdbet, args.skip_atlas, args.device)
+        except Exception as e:  # one bad job must not stop the remaining ones
+            traceback.print_exc()
+            print(f"\n!! FAILED {job['subject_id']} ({job['local_dir']}/{job['study_date']}): "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            print(f"   partial output (if any) is under {PREPROCESS_DIR / job['subject_id']}; "
+                  f"a re-run overwrites it", file=sys.stderr)
+            failed.append(job["subject_id"])
 
+    if failed:
+        print(f"\n{len(failed)} of {len(jobs)} job(s) FAILED: {', '.join(failed)}", file=sys.stderr)
+        sys.exit(1)
     print(f"\nDone. Output under: {PREPROCESS_DIR}")
 
 

@@ -14,6 +14,7 @@ SimpleITK). See GUI_README.md for usage.
 Run (from the unet_venv conda env):
     python3 preprocess_gui.py
 """
+import contextlib
 import csv
 import os
 import queue
@@ -24,12 +25,18 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from inventory_export import SER_NAME_RE, find_series_roots, inspect_series
+try:
+    import fcntl  # POSIX only; without it the registry lock is a no-op
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+from inventory_export import SER_NAME_RE, _series_files, find_series_roots, inspect_series
 from select_modalities import (
-    EXCLUDE_PATTERN, REGISTRY_PATH, classify, load_registered_keys, read_series_headers,
+    REGISTRY_PATH, classify, load_registered_keys, read_series_headers,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -40,8 +47,16 @@ MODALITIES = ["t1n", "t1c", "t2w", "t2f"]
 REGISTRY_COLUMNS = ["subject_id", "patient_id", "local_dir", "study_date", *MODALITIES]
 FLAIR_PATTERN = re.compile(r"FLAIR", re.IGNORECASE)
 SUBJECT_ID_RE = re.compile(r"^MDB_(\d+)$")
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")  # subject_id becomes a directory name
 # inspect_series() statuses that mean "possibly truncated" (UNVERIFIED/COMPLETE are not flags)
-BAD_STATUSES = {"EMPTY", "SHORT", "GAPS", "AMBIGUOUS-TOTAL", "UNREADABLE"}
+BAD_STATUSES = {"EMPTY", "SHORT", "GAPS", "AMBIGUOUS-TOTAL", "UNREADABLE", "ERROR"}
+# statuses where there is no usable image data at all -- never suggested, never allowed in the registry
+NO_DATA_STATUSES = {"EMPTY", "UNREADABLE", "ERROR"}
+MIN_FREE_GB = 5.0
+
+
+class RegistryError(Exception):
+    """The registry can't be read/written, or a row would corrupt it."""
 
 
 # --------------------------------------------------------------------------
@@ -71,11 +86,18 @@ def discover_studies(selected: Path):
     return raw_root, studies
 
 
+def _error_record(ser_id: str, description: str, status: str, detail: str = "") -> dict:
+    return {"ser_id": ser_id, "description": description, "modality": "", "plane": "?", "acq": "",
+            "contrast": "", "files": 0, "status": status, "gaps": None, "excluded": True, "error": detail}
+
+
 def scan_study(series_root: Path, progress=None) -> dict:
     """Series list for one study: description, header facts (plane, 2D/3D,
     contrast, ...) and inspect_series()'s truncation status per series.
-    Series without pixel data (PR/KO/SR, localizer stubs) are dropped, as in
-    select_modalities.py."""
+    Series without pixel data (PR/KO/SR) are dropped, as in
+    select_modalities.py. A series that is empty, unreadable, or that raises
+    while being read is KEPT and flagged (EMPTY / UNREADABLE / ERROR) rather
+    than being dropped or aborting the whole scan."""
     series, patient_id, patient_name = [], "", ""
     ser_dirs = sorted(d for d in series_root.glob("SER_*") if d.is_dir())
     for i, ser_dir in enumerate(ser_dirs):
@@ -85,24 +107,32 @@ def scan_study(series_root: Path, progress=None) -> dict:
         if not match:
             continue
         ser_id, description = match.groups()
-        headers = read_series_headers(ser_dir)
-        if not headers or headers.get("no_pixel_data"):
-            continue
-        record = inspect_series(ser_dir)
-        patient_id = patient_id or headers.get("patient_id", "")
-        patient_name = patient_name or headers.get("patient_name", "")
-        series.append({
-            "ser_id": ser_id,
-            "description": description,
-            "modality": headers.get("modality", ""),
-            "plane": headers.get("plane", "?"),
-            "acq": headers.get("acquisition_type", ""),
-            "contrast": headers.get("contrast_agent", ""),
-            "files": record.get("on_disk", 0),
-            "status": record.get("status", "?"),
-            "gaps": record.get("instance_gaps"),
-            "excluded": classify(description, headers.get("modality", "")) is None,
-        })
+        try:
+            headers = read_series_headers(ser_dir)
+            if headers.get("no_pixel_data") and headers.get("modality"):
+                continue  # PR/KO/SR and other non-image objects
+            if not headers or headers.get("no_pixel_data"):  # nothing in the folder parsed as an image
+                status = "EMPTY" if not _series_files(ser_dir) else "UNREADABLE"
+                series.append(_error_record(ser_id, description, status))
+                continue
+            record = inspect_series(ser_dir)
+            patient_id = patient_id or headers.get("patient_id", "")
+            patient_name = patient_name or headers.get("patient_name", "")
+            series.append({
+                "ser_id": ser_id,
+                "description": description,
+                "modality": headers.get("modality", ""),
+                "plane": headers.get("plane", "?"),
+                "acq": headers.get("acquisition_type", ""),
+                "contrast": headers.get("contrast_agent", ""),
+                "files": record.get("on_disk", 0),
+                "status": record.get("status", "?"),
+                "gaps": record.get("instance_gaps"),
+                "excluded": classify(description, headers.get("modality", "")) is None,
+                "error": "",
+            })
+        except Exception as e:  # one bad series must not lose the rest of the study
+            series.append(_error_record(ser_id, description, "ERROR", f"{type(e).__name__}: {e}"))
     return {"series": series, "patient_id": patient_id, "patient_name": patient_name}
 
 
@@ -111,14 +141,16 @@ def suggest_modalities(series: list) -> dict:
     (classify / EXCLUDE_PATTERN) plus the MODALITY_SELECTION.md preferences:
     pre- vs post-contrast comes from the ContrastBolusAgent TAG, never the
     name; 3D beats 2D; axial beats other planes; more slices break ties.
-    Only a suggestion -- the user confirms in the GUI."""
+    Series with no usable data are skipped. Only a suggestion -- the user
+    confirms in the GUI."""
     def best(candidates):
         if not candidates:
             return None
         return max(candidates, key=lambda s: (s["acq"] == "3D", s["plane"] == "AX", s["files"]))["ser_id"]
 
-    t1 = [s for s in series if classify(s["description"], s["modality"]) == "t1"]
-    t2 = [s for s in series if classify(s["description"], s["modality"]) == "t2f"]
+    usable = [s for s in series if s["status"] not in NO_DATA_STATUSES]
+    t1 = [s for s in usable if classify(s["description"], s["modality"]) == "t1"]
+    t2 = [s for s in usable if classify(s["description"], s["modality"]) == "t2f"]
     t2w_pool = [s for s in t2 if not FLAIR_PATTERN.search(s["description"])]
     t2f_pool = [s for s in t2 if FLAIR_PATTERN.search(s["description"])]
 
@@ -135,16 +167,28 @@ def suggest_modalities(series: list) -> dict:
 
 
 def read_registry_rows(path: Path) -> list:
-    """Registry rows as dicts with whitespace stripped (the CSV is
-    hand-edited with ', ' padding)."""
+    """Registry rows as dicts (all REGISTRY_COLUMNS present, whitespace
+    stripped -- the CSV is hand-edited with ', ' padding). A missing or empty
+    file is an empty registry. An unreadable file, or a header that lacks a
+    required column, raises RegistryError instead of failing later with a
+    KeyError."""
+    path = Path(path)
     if not path.exists():
         return []
-    with path.open(newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            return []
-        reader.fieldnames = [(n or "").strip() for n in reader.fieldnames]
-        return [{k: (v or "").strip() for k, v in row.items() if k} for row in reader]
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                return []
+            names = [(n or "").strip() for n in reader.fieldnames]
+            missing = [c for c in REGISTRY_COLUMNS if c not in names]
+            if missing:
+                raise RegistryError(f"{path.name}: header is missing column(s): {', '.join(missing)}")
+            reader.fieldnames = names
+            rows = [{c: (row.get(c) or "").strip() for c in REGISTRY_COLUMNS} for row in reader]
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        raise RegistryError(f"cannot read {path}: {e}") from e
+    return [r for r in rows if any(r.values())]
 
 
 def next_subject_id(rows: list) -> str:
@@ -156,44 +200,20 @@ def _csv_field(value: str) -> str:
     return '"' + value.replace('"', '""') + '"' if re.search(r'[,"\n]', value) else value
 
 
-def append_registry_row(path: Path, row: dict):
-    """Append one row in the registry's existing ', '-padded style. Writes a
-    temp file and renames it over the registry (after a .bak copy), so a crash
-    mid-write can't leave a half-written registry. A field that needs CSV
-    quoting is written without the preceding space (csv only recognises a
-    quote at the very start of a field)."""
-    header = ", ".join(REGISTRY_COLUMNS)
-    existing = path.read_text() if path.exists() else ""
-    if not existing.strip():
-        existing = header + "\n"
-    elif not existing.endswith("\n"):
-        existing += "\n"
-
-    line = ""
-    for i, col in enumerate(REGISTRY_COLUMNS):
-        field = _csv_field(row[col])
-        if i:
-            line += "," if field.startswith('"') else ", "
-        line += field
-
-    if path.exists():
-        shutil.copy2(path, path.with_name(path.name + ".bak"))
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(existing + line + "\n")
-    os.replace(tmp, path)
-
-
 def validate_new_row(row: dict, rows: list) -> list:
     """Hard errors that must stop the add (mirrors braTS_preprocess.load_registry's
     checks so a row we write is never one the pipeline refuses to load)."""
     errors = []
     for col in REGISTRY_COLUMNS:
-        if not row[col].strip():
+        if not row.get(col, "").strip():
             errors.append(f"'{col}' is empty")
     for col in ("subject_id", "patient_id"):
-        if re.search(r"[,\"\n]", row[col]):
+        if re.search(r"[,\"\n]", row.get(col, "")):
             errors.append(f"'{col}' must not contain commas or quotes")
-    chosen = [row[m] for m in MODALITIES if row[m]]
+    sid = row.get("subject_id", "")
+    if sid and (not SAFE_ID_RE.match(sid) or sid in (".", "..")):
+        errors.append("'subject_id' may only contain letters, digits, '_', '-' and '.' (it becomes a folder name)")
+    chosen = [row[m] for m in MODALITIES if row.get(m)]
     if len(set(chosen)) != len(chosen):
         errors.append("the same series is selected for more than one modality")
     for r in rows:
@@ -204,6 +224,155 @@ def validate_new_row(row: dict, rows: list) -> list:
     if any((r["local_dir"], r["study_date"], r["subject_id"]) == key for r in rows):
         errors.append("that exact (local_dir, study_date, subject_id) row already exists")
     return errors
+
+
+@contextlib.contextmanager
+def registry_lock(path: Path):
+    """Exclusive advisory lock so two GUI instances (or a GUI and a script)
+    can't both read-modify-write the registry and lose a row."""
+    lock_path = path.with_name(path.name + ".lock")
+    f = open(lock_path, "w")
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        f.close()  # closing releases the lock
+
+
+def add_registry_row(path: Path, row: dict):
+    """Validate against the registry's *current* contents and append `row`,
+    all under registry_lock(). Raises RegistryError (with every problem found)
+    and never leaves a half-written file: the new content goes to a temp file
+    that is renamed over the registry (after a .bak copy), in the registry's
+    existing ', '-padded style. A field that needs CSV quoting is written
+    without the preceding space (csv only recognises a quote at the very
+    start of a field)."""
+    path = Path(path)
+    try:
+        with registry_lock(path):
+            rows = read_registry_rows(path)
+            errors = validate_new_row(row, rows)
+            if errors:
+                raise RegistryError("\n".join(errors))
+
+            header = ", ".join(REGISTRY_COLUMNS)
+            existing = path.read_text() if path.exists() else ""
+            if not existing.strip():
+                existing = header + "\n"
+            else:
+                names = [n.strip() for n in existing.splitlines()[0].split(",")]
+                if names != REGISTRY_COLUMNS:
+                    raise RegistryError(f"{path.name}: columns must be exactly '{header}' (in that order) "
+                                        f"to append safely; found '{', '.join(names)}'")
+                if not existing.endswith("\n"):
+                    existing += "\n"
+
+            line = ""
+            for i, col in enumerate(REGISTRY_COLUMNS):
+                field = _csv_field(row[col])
+                if i:
+                    line += "," if field.startswith('"') else ", "
+                line += field
+
+            if path.exists():
+                shutil.copy2(path, path.with_name(path.name + ".bak"))
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(existing + line + "\n")
+            os.replace(tmp, path)
+    except OSError as e:
+        raise RegistryError(f"cannot write {path}: {e}") from e
+
+
+def find_study_root(raw_root: Path, local_dir: str, study_date: str) -> Path:
+    """The folder holding SER_* dirs for (local_dir, study_date) under raw_root
+    -- the same lookup braTS_preprocess.series_root_for() does, without
+    importing SimpleITK."""
+    patient_dir = Path(raw_root) / local_dir
+    if not patient_dir.is_dir():
+        raise FileNotFoundError(f"patient folder not found: {patient_dir}")
+    for series_root in find_series_roots(patient_dir):
+        rel = series_root.relative_to(patient_dir)
+        if (rel.parts[0] if rel.parts else patient_dir.name) == study_date:
+            return series_root
+    raise FileNotFoundError(f"no SER_* folders for study '{study_date}' under {patient_dir}")
+
+
+def _nearest_existing(path: Path) -> Path:
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def preflight(rows: list, raw_root, out_root, min_free_gb: float = MIN_FREE_GB):
+    """Checks to run BEFORE launching the pipeline, so a bad setup fails with a
+    readable message instead of a traceback minutes in. `rows` are the registry
+    rows that will run. Returns (errors, warnings): errors block the run,
+    warnings need the user's confirmation."""
+    errors, warnings = [], []
+    raw_root, out_root = Path(raw_root), Path(out_root).expanduser()
+
+    if not PREPROCESS_SCRIPT.is_file():
+        errors.append(f"pipeline script not found: {PREPROCESS_SCRIPT}")
+    raw_ok = raw_root.is_dir()
+    if not raw_ok:
+        errors.append(f"raw root is not a folder: {raw_root}")
+
+    out_res = out_root.resolve()
+    if raw_ok:
+        raw_res = raw_root.resolve()
+        if out_res == raw_res or raw_res in out_res.parents:
+            errors.append(f"the output directory must not be inside the raw folder ({raw_root})")
+    anchor = _nearest_existing(out_res)
+    if not anchor.is_dir():
+        errors.append(f"output path {anchor} exists but is not a directory")
+    elif not os.access(anchor, os.W_OK | os.X_OK):
+        errors.append(f"no permission to write under {anchor}")
+    else:
+        try:
+            free = shutil.disk_usage(anchor).free
+            if free < min_free_gb * 2 ** 30:
+                warnings.append(f"only {free / 2 ** 30:.1f} GB free under {anchor} "
+                                f"(each subject can need ~1 GB or more)")
+        except OSError as e:
+            warnings.append(f"could not check free disk space: {e}")
+
+    seen = {}
+    for r in rows:
+        label = f"{r.get('subject_id', '?')} ({r.get('local_dir', '?')}/{r.get('study_date', '?')})"
+        empty = [c for c in REGISTRY_COLUMNS if not r.get(c)]
+        if empty:
+            errors.append(f"{label}: registry row has empty field(s): {', '.join(empty)}")
+            continue
+        seen[r["subject_id"]] = seen.get(r["subject_id"], 0) + 1
+        if not raw_ok:
+            continue
+        try:
+            series_root = find_study_root(raw_root, r["local_dir"], r["study_date"])
+        except (OSError, ValueError) as e:
+            errors.append(f"{label}: {e}")
+            continue
+        for mod in MODALITIES:
+            ser_id = r[mod]
+            if (series_root / ser_id).is_dir():
+                ser_dir = series_root / ser_id
+            else:
+                matches = [m for m in series_root.glob(f"{ser_id}_*") if m.is_dir()]
+                if len(matches) != 1:
+                    errors.append(f"{label}: {mod} = {ser_id}: expected exactly one matching series folder, "
+                                  f"found {len(matches)}")
+                    continue
+                ser_dir = matches[0]
+            if not _series_files(ser_dir):
+                errors.append(f"{label}: {mod} = {ser_id} has no image files")
+
+    for sid, n in seen.items():
+        if n > 1:
+            warnings.append(f"{sid} has {n} registry rows; they all run and write into the same {sid}/ folder")
+        existing = out_res / sid
+        if existing.is_dir() and any(existing.iterdir()):
+            warnings.append(f"{existing} already has output; it will be overwritten")
+    return errors, warnings
 
 
 def build_preprocess_cmd(subject_id, raw_root, out_root, registry, skip_hdbet, skip_atlas, device):
@@ -217,6 +386,22 @@ def build_preprocess_cmd(subject_id, raw_root, out_root, registry, skip_hdbet, s
     return cmd
 
 
+def terminate_process_group(proc, grace: float = 5.0):
+    """SIGTERM the child's whole process group (python + hd-bet), SIGKILL if it
+    is still alive after `grace` seconds. Safe to call on an exited process."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
@@ -227,12 +412,17 @@ class App(ttk.Frame):
         self.pack(fill="both", expand=True)
         master.title("Medulloblastoma preprocessing")
         master.geometry("1250x900")
+        master.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Tk swallows exceptions in callbacks (prints to the terminal only);
+        # surface them in the log and a dialog instead
+        master.report_callback_exception = self._report_exception
 
         self.q = queue.Queue()
         self.studies = []          # [{local_dir, study_date, series_root, series, patient_id, ...}]
         self.current = None        # study dict currently shown
         self.label_to_ser = {}     # combobox label -> SER id (current study)
         self.proc = None
+        self.running = False
         self.cancel_requested = False
         self.registry_path = REGISTRY_PATH
 
@@ -246,9 +436,16 @@ class App(ttk.Frame):
         self.skip_atlas = tk.BooleanVar(value=False)
         self.device_var = tk.StringVar(value="cpu")
 
+        self._poll_id = None
+        self.bind("<Destroy>", self._on_destroy)
         self._build()
         self.refresh_registry()
-        self.after(100, self._poll)
+        self._poll_id = self.after(100, self._poll)
+
+    def _on_destroy(self, event):
+        if event.widget is self and self._poll_id:
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(self._poll_id)
 
     # ---- layout ----
     def _build(self):
@@ -274,7 +471,7 @@ class App(ttk.Frame):
         self.study_tree.bind("<<TreeviewSelect>>", self.on_study_select)
         mid.add(left, weight=1)
 
-        right = ttk.LabelFrame(mid, text="2. Series in selected study (grey = excluded type, red = possible truncation)")
+        right = ttk.LabelFrame(mid, text="2. Series in selected study (grey = excluded type, red = possible truncation / unreadable)")
         cols = ("ser", "description", "plane", "acq", "contrast", "files", "status")
         self.series_tree = ttk.Treeview(right, columns=cols, show="headings", height=8, selectmode="none")
         for col, w in zip(cols, (80, 190, 50, 50, 110, 55, 110)):
@@ -350,6 +547,10 @@ class App(ttk.Frame):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _report_exception(self, exc, val, tb):
+        self.log_line("Unexpected error:\n" + "".join(traceback.format_exception(exc, val, tb)))
+        messagebox.showerror("Unexpected error", f"{exc.__name__}: {val}\n\nDetails are in the log.")
+
     def _browse_into(self, var):
         d = filedialog.askdirectory(initialdir=var.get() or str(SCRIPT_DIR))
         if d:
@@ -380,12 +581,24 @@ class App(ttk.Frame):
             if not found:
                 self.q.put(("scan_done", raw_root, []))
                 return
-            registered = load_registered_keys(self.registry_path)
+            try:
+                registered = load_registered_keys(self.registry_path)
+            except Exception as e:  # unreadable registry must not block scanning
+                registered = set()
+                self.q.put(("log", f"  warning: could not read registry to mark known studies: {e}"))
             studies = []
             for n, (local_dir, study_date, series_root) in enumerate(found):
                 self.q.put(("progress", n, len(found)))
                 self.q.put(("log", f"  [{n + 1}/{len(found)}] {local_dir}/{study_date}"))
-                info = scan_study(series_root)
+                try:
+                    info = scan_study(series_root)
+                    for s in info["series"]:
+                        if s.get("error"):
+                            self.q.put(("log", f"    {s['ser_id']} {s['description']}: {s['status']} -- {s['error']}"))
+                except Exception as e:  # this study failed; keep scanning the others
+                    info = {"series": [], "patient_id": "", "patient_name": "",
+                            "scan_error": f"{type(e).__name__}: {e}"}
+                    self.q.put(("log", f"    scan failed: {info['scan_error']}"))
                 info.update(local_dir=local_dir, study_date=study_date, series_root=series_root,
                             registered=(local_dir, study_date) in registered)
                 studies.append(info)
@@ -402,14 +615,14 @@ class App(ttk.Frame):
             self.log_line("No SER_* folders found under that folder.")
             return
         for i, s in enumerate(studies):
-            state = "registered" if s["registered"] else "new"
+            state = "SCAN FAILED" if s.get("scan_error") else ("registered" if s["registered"] else "new")
             self.study_tree.insert("", "end", iid=str(i),
                                    values=(s["local_dir"], s["study_date"], s["patient_id"], state))
         flagged = sum(1 for s in studies for x in s["series"] if x["status"] in BAD_STATUSES)
         self.log_line(f"Found {len(studies)} study(ies); raw root = {raw_root}")
-        self.log_line(f"{flagged} series flagged for possible truncation (red). Note: without a DICOMDIR this check "
-                      f"only sees InstanceNumber gaps / declared slice counts -- 'UNVERIFIED' is not a guarantee.")
-        first_new = next((i for i, s in enumerate(studies) if not s["registered"]), 0)
+        self.log_line(f"{flagged} series flagged for possible truncation / unreadable (red). Note: without a DICOMDIR "
+                      f"this check only sees InstanceNumber gaps / declared slice counts -- 'UNVERIFIED' is not a guarantee.")
+        first_new = next((i for i, s in enumerate(studies) if not s["registered"] and not s.get("scan_error")), 0)
         self.study_tree.selection_set(str(first_new))
 
     # ---- study selection ----
@@ -438,15 +651,22 @@ class App(ttk.Frame):
             self.combos[mod].configure(values=labels)
             self.mod_vars[mod].set(ser_to_label.get(suggestion[mod], ""))
         missing = [m for m in MODALITIES if not suggestion[m]]
-        rows = read_registry_rows(self.registry_path)
-        self.subject_var.set(next_subject_id(rows))
+        try:
+            self.subject_var.set(next_subject_id(read_registry_rows(self.registry_path)))
+            registry_note = ""
+        except RegistryError as e:
+            self.subject_var.set("")
+            self.log_line(f"Registry problem: {e}")
+            registry_note = "  -- REGISTRY UNREADABLE (see log)"
         self.patient_var.set(study["patient_id"])
         note = f"{study['local_dir']}/{study['study_date']}"
-        if missing:
+        if study.get("scan_error"):
+            note += f"  -- scan failed: {study['scan_error']}"
+        elif missing:
             note += f"  -- needs selection: {', '.join(missing)}"
         if study["registered"]:
             note += "  -- already in registry"
-        self.study_label.configure(text=note)
+        self.study_label.configure(text=note + registry_note)
 
     # ---- registry ----
     def refresh_registry(self):
@@ -454,8 +674,8 @@ class App(ttk.Frame):
         self.reg_tree.delete(*self.reg_tree.get_children())
         try:
             rows = read_registry_rows(self.registry_path)
-        except Exception as e:
-            self.log_line(f"Could not read registry: {e}")
+        except RegistryError as e:
+            self.log_line(f"Registry problem: {e}")
             return
         for i, r in enumerate(rows):
             self.reg_tree.insert("", "end", iid=str(i), values=(*[r.get(c, "") for c in REGISTRY_COLUMNS], ""))
@@ -474,13 +694,22 @@ class App(ttk.Frame):
         }
         for mod in MODALITIES:
             row[mod] = self.label_to_ser.get(self.mod_vars[mod].get(), "")
-        rows = read_registry_rows(self.registry_path)
+        try:
+            rows = read_registry_rows(self.registry_path)
+        except RegistryError as e:
+            messagebox.showerror("Cannot add", f"The registry can't be used:\n{e}")
+            return
         errors = validate_new_row(row, rows)
+
+        by_ser = {s["ser_id"]: s for s in study["series"]}
+        for mod in MODALITIES:  # no data at all: never allowed, not just a warning
+            s = by_ser.get(row[mod])
+            if s and s["status"] in NO_DATA_STATUSES:
+                errors.append(f"{mod} = {s['ser_id']} has no readable image data ({s['status']})")
         if errors:
             messagebox.showerror("Cannot add", "\n".join(f"- {e}" for e in errors))
             return
 
-        by_ser = {s["ser_id"]: s for s in study["series"]}
         warnings = []
         for mod in MODALITIES:
             s = by_ser[row[mod]]
@@ -501,15 +730,17 @@ class App(ttk.Frame):
             return
 
         try:
-            append_registry_row(self.registry_path, row)
-        except Exception as e:
-            messagebox.showerror("Add to registry", f"Could not write registry:\n{e}")
+            add_registry_row(self.registry_path, row)  # re-validates under a lock against the current file
+        except RegistryError as e:
+            messagebox.showerror("Add to registry", f"Could not add the row:\n{e}")
+            self.refresh_registry()
             return
         study["registered"] = True
         sel = self.study_tree.selection()
         if sel:
             self.study_tree.set(sel[0], "state", "registered")
-        self.subject_var.set(next_subject_id(read_registry_rows(self.registry_path)))
+        with contextlib.suppress(RegistryError):
+            self.subject_var.set(next_subject_id(read_registry_rows(self.registry_path)))
         self.log_line(f"Added {row['subject_id']} ({row['local_dir']}/{row['study_date']}) to {self.registry_path.name}"
                       f" (backup: {self.registry_path.name}.bak)")
         self.refresh_registry()
@@ -520,14 +751,14 @@ class App(ttk.Frame):
         if not sel:
             messagebox.showinfo("Preprocess", "Select one or more registry rows first.")
             return
-        out_root = Path(self.out_var.get().strip())
-        raw_root = Path(self.raw_root_var.get().strip())
-        if not self.out_var.get().strip():
+        if self.running:
+            return
+        out_text = self.out_var.get().strip()
+        if not out_text:
             messagebox.showerror("Preprocess", "Choose an output directory.")
             return
-        if not raw_root.is_dir():
-            messagebox.showerror("Preprocess", f"Raw root is not a folder:\n{raw_root}")
-            return
+        out_root = Path(out_text).expanduser()
+        raw_root = Path(self.raw_root_var.get().strip())
         if not self.skip_hdbet.get() and shutil.which("hd-bet") is None:
             messagebox.showerror("Preprocess", "hd-bet is not on PATH. Run from the unet_venv environment "
                                  "or tick 'Skip HD-BET'.")
@@ -537,8 +768,20 @@ class App(ttk.Frame):
             subject = self.reg_tree.set(iid, "subject_id")
             if subject not in subjects:
                 subjects.append(subject)
-        if not messagebox.askyesno("Preprocess", f"Preprocess {len(subjects)} subject(s) into\n{out_root}\n\n"
-                                   f"{', '.join(subjects)}\n\nThis can take a long time."):
+        try:  # re-read: the table may be stale, and the file is what the pipeline will load
+            rows = [r for r in read_registry_rows(self.registry_path) if r["subject_id"] in subjects]
+        except RegistryError as e:
+            messagebox.showerror("Preprocess", f"The registry can't be used:\n{e}")
+            return
+
+        errors, warnings = preflight(rows, raw_root, out_root)
+        if errors:
+            messagebox.showerror("Cannot start", "\n".join(f"- {e}" for e in errors))
+            return
+        text = f"Preprocess {len(subjects)} subject(s) into\n{out_root}\n\n{', '.join(subjects)}\n"
+        if warnings:
+            text += "\nWarnings:\n" + "\n".join(f"- {w}" for w in warnings) + "\n"
+        if not messagebox.askyesno("Preprocess", text + "\nThis can take a long time. Continue?"):
             return
         try:
             out_root.mkdir(parents=True, exist_ok=True)
@@ -546,6 +789,7 @@ class App(ttk.Frame):
             messagebox.showerror("Preprocess", f"Cannot create output directory:\n{e}")
             return
 
+        self.running = True
         self.run_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.cancel_requested = False
@@ -556,40 +800,54 @@ class App(ttk.Frame):
         threading.Thread(target=self._run_worker, args=args, daemon=True).start()
 
     def _run_worker(self, subjects, raw_root, out_root, registry, skip_hdbet, skip_atlas, device):
-        for subject in subjects:
-            if self.cancel_requested:
-                self.q.put(("status", subject, "cancelled"))
-                continue
-            self.q.put(("status", subject, "running"))
-            cmd = build_preprocess_cmd(subject, raw_root, out_root, registry, skip_hdbet, skip_atlas, device)
-            self.q.put(("log", f"\n$ {' '.join(cmd)}"))
-            try:
-                # own session so Cancel can kill hd-bet along with the python child
-                self.proc = subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                             text=True, start_new_session=True)
-                for line in self.proc.stdout:
-                    self.q.put(("log", line))
-                code = self.proc.wait()
-            except Exception as e:
-                self.q.put(("log", f"Failed to launch: {e}"))
+        try:
+            for subject in subjects:
+                if self.cancel_requested:
+                    self.q.put(("status", subject, "cancelled"))
+                    continue
+                self.q.put(("status", subject, "running"))
+                cmd = build_preprocess_cmd(subject, raw_root, out_root, registry, skip_hdbet, skip_atlas, device)
+                self.q.put(("log", f"\n$ {' '.join(cmd)}"))
                 code = -1
-            if self.cancel_requested:
-                status = "cancelled"
-            else:
-                status = "done" if code == 0 else f"FAILED ({code})"
-            self.q.put(("status", subject, status))
-        self.proc = None
-        self.q.put(("run_done", str(out_root)))
+                try:
+                    # own session so Cancel can kill hd-bet along with the python child;
+                    # stderr merged so tracebacks land in the log; undecodable bytes must not kill the reader
+                    with subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True, errors="replace", start_new_session=True) as proc:
+                        self.proc = proc
+                        if self.cancel_requested:  # Cancel landed between the check above and the launch
+                            terminate_process_group(proc)
+                        for line in proc.stdout:
+                            self.q.put(("log", line))
+                        code = proc.wait()
+                except Exception as e:
+                    self.q.put(("log", f"Failed to run the pipeline: {type(e).__name__}: {e}"))
+                if self.cancel_requested:
+                    status = "cancelled"
+                else:
+                    status = "done" if code == 0 else f"FAILED ({code})"
+                self.q.put(("status", subject, status))
+        except Exception:  # whatever happens, the buttons must come back
+            self.q.put(("log", "Internal error in the run thread:\n" + traceback.format_exc()))
+        finally:
+            self.proc = None
+            self.q.put(("run_done", str(out_root)))
 
     def cancel(self):
         self.cancel_requested = True
         proc = self.proc
         if proc and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            # don't block the UI for the SIGTERM grace period
+            threading.Thread(target=terminate_process_group, args=(proc,), daemon=True).start()
         self.log_line("Cancel requested.")
+
+    def on_close(self):
+        if self.running:
+            if not messagebox.askyesno("Quit", "Preprocessing is still running. Stop it and quit?"):
+                return
+            self.cancel_requested = True
+            terminate_process_group(self.proc, grace=3.0)  # don't leave python/hd-bet running orphaned
+        self.master.destroy()
 
     # ---- queue pump ----
     def _poll(self):
@@ -612,12 +870,15 @@ class App(ttk.Frame):
                         if self.reg_tree.set(iid, "subject_id") == msg[1]:
                             self.reg_tree.set(iid, "run_status", msg[2])
                 elif kind == "run_done":
+                    self.running = False
                     self.run_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
                     self.log_line(f"\nFinished. Output under: {msg[1]}")
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        except Exception:  # a bad message must not kill the pump (and with it all UI updates)
+            self.log_line("Internal error in the UI update loop:\n" + traceback.format_exc())
+        self._poll_id = self.after(100, self._poll)
 
 
 def main():
